@@ -2,120 +2,141 @@ import json
 from typing import Any, Union
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from app.core.config import settings
-from app.engine.heads import NoulHead, ScoreHead, ChoiceHead
-from app.engine.calibration import (calculate_choice_confidence, calculate_score_confidence)
+from app.engine.calibration import (
+    calculate_choice_confidence,
+    calculate_score_confidence,
+)
 from app.schemas.request import SystemOneRequest, ChoiceQuestion, ScoreQuestion, NoulQuestion
 from app.schemas.response import SystemOneResponse, ChoiceAnswer, ScoreAnswer, NoulAnswer, Answer
 
-class SystemOneEngine(nn.Module):
-    def __init__(self, model_name : str = settings.model_name, device: str = settings.device):
 
+class SystemOneEngine(nn.Module):
+    def __init__(self, model_name: str = settings.model_name, device: str = settings.device):
         super().__init__()
         self.device = torch.device(device)
         self.model_version = settings.model_version
 
-        # 1. Load Tokenizer & Base Transformer Backbone (No LM text-generation head!)
+        # 1. Load Tokenizer & Causal LM (to access single-pass vocabulary logits)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.backbone = AutoModel.from_pretrained(model_name)
-        self.backbone.to(self.device)
+        self.backbone = AutoModelForCausalLM.from_pretrained(model_name)
+        self.backbone.to(device=self.device, dtype=self.backbone.dtype)
         self.backbone.eval()
 
-        hidden_size = self.backbone.config.hidden_size
-
-        # 2. Attach our system one  decision heads
-        dtype = self.backbone.dtype
-        self.noul_head = NoulHead(hidden_size).to(self.device, dtype=dtype)
-        self.score_head = ScoreHead(hidden_size).to(self.device, dtype=dtype)
-        self.choice_head = ChoiceHead(hidden_size).to(self.device, dtype=dtype)
-
-    def _format_state(self, state: Union[str, dict[str,Any], list[Any]]) -> str:
+    def _format_state(self, state: Union[str, dict[str, Any], list[Any]]) -> str:
         if isinstance(state, str):
             return state
         return json.dumps(state, indent=2)
 
-    def _format_chat(self, role: str, content:str, add_generation_prompt: bool = False) -> str:
-        """ Uses tokenizer's official chat template for aximum portability."""
+    def _format_chat(self, role: str, content: str, add_generation_prompt: bool = False) -> str:
         messages = [{"role": role, "content": content}]
-        return self.tokenizer.apply_chat_template(messages, tokenize= False, add_generation_prompt=add_generation_prompt)
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt
+        )
 
-    def _get_embedding(self, text: str) -> torch.Tensor:
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            outputs = self.backbone(**inputs)
-        return outputs.last_hidden_state[:, -1, :].squeeze(0)
+    def _get_first_token_id(self, word: str) -> int:
+        """Helper to get the exact token ID for a candidate word."""
+        # Prepend a space because in sentence context words are preceded by space
+        token_ids = self.tokenizer.encode(" " + word.strip(), add_special_tokens=False)
+        return token_ids[0] if token_ids else self.tokenizer.encode(word.strip(), add_special_tokens=False)[0]
 
     @torch.no_grad()
     def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
-        # step 1: format state using the model's official chat template
-        state_text = F"State Context:\n{ self._format_state(request.state)}"
-        formatted_state = self._format_chat(role="system", content=state_text,add_generation_prompt=False)
+        # Step 1: Ingest State ONCE to get KV-cache
+        state_text = f"State Context:\n{self._format_state(request.state)}"
+        formatted_state = self._format_chat(role="system", content=state_text, add_generation_prompt=False)
         state_inputs = self.tokenizer(formatted_state, return_tensors="pt").to(self.device)
 
-        # Ingest state Once to get KV-cache
-        state_outputs = self.backbone(**state_inputs,use_cache=True)
+        state_outputs = self.backbone(**state_inputs, use_cache=True)
         state_kv_cache = state_outputs.past_key_values
 
         answers: dict[str, Answer] = {}
 
-        # step 2 : evaluate each question against the cached state
+        # Step 2: Evaluate each question against the cached state in 1 single forward pass
         for q_id, question in request.questions.items():
             if isinstance(question, NoulQuestion):
-                q_content = F"Statement: {question.statement}\n Is this statemnet true?"
-                q_text = self._format_chat(role="user", content=q_content, add_generation_prompt= True)
-                q_inputs = self.tokenizer(q_text, return_tensors="pt").to(self.device)
-
-                q_out = self.backbone(**q_inputs, past_key_values= state_kv_cache)
-                query_hidden = q_out.last_hidden_state[:, -1, :].squeeze(0)
-                true_emb = self._get_embedding("Yes, this statement is true.")
-                false_emb = self._get_embedding("No, this statement is false.")
-                prob = self.noul_head(query_hidden, true_emb, false_emb)
-
-                answers[q_id] = NoulAnswer(noul=round(prob, 4))
-            elif isinstance(question, ChoiceQuestion):
-                q_content = f"Question: {question.instructions}\nSelect the best option from the criteria."
+                # Format truth verification prompt
+                q_content = f"Statement: {question.statement}\nIs this statement true? (Answer True or False):"
                 q_text = self._format_chat(role="user", content=q_content, add_generation_prompt=True)
                 q_inputs = self.tokenizer(q_text, return_tensors="pt").to(self.device)
+
+                # Single forward pass!
                 q_out = self.backbone(**q_inputs, past_key_values=state_kv_cache)
-                query_hidden = q_out.last_hidden_state[:, -1, :].squeeze(0)
+                last_token_logits = q_out.logits[0, -1, :]
+
+                # Read logits for candidate words "True" vs "False"
+                true_id = self._get_first_token_id("True")
+                false_id = self._get_first_token_id("False")
+                
+                tf_logits = torch.tensor([last_token_logits[false_id].item(), last_token_logits[true_id].item()])
+                tf_probs = torch.softmax(tf_logits, dim=-1)
+                true_prob = tf_probs[1].item()
+
+                answers[q_id] = NoulAnswer(noul=round(true_prob, 4))
+
+            elif isinstance(question, ChoiceQuestion):
                 option_names = list(question.criteria.keys())
-                option_texts = [f"{k}: {v}" for k, v in question.criteria.items()]
-                option_hiddens = torch.stack([self._get_embedding(t) for t in option_texts])
-                probs_tensor = self.choice_head(query_hidden, option_hiddens, temperature=settings.default_temperature)
-                probs_list = probs_tensor.tolist()
-                prob_dict = {name: round(p, 4) for name, p in zip(option_names, probs_list)}
+                options_str = "\n".join([f"- {k}: {v}" for k, v in question.criteria.items()])
+                q_content = f"Question: {question.instructions}\nOptions:\n{options_str}\nSelected Option:"
+                q_text = self._format_chat(role="user", content=q_content, add_generation_prompt=True)
+                q_inputs = self.tokenizer(q_text, return_tensors="pt").to(self.device)
+
+                # Single forward pass!
+                q_out = self.backbone(**q_inputs, past_key_values=state_kv_cache)
+                last_token_logits = q_out.logits[0, -1, :]
+
+                # Read logits for each candidate option key
+                cand_ids = [self._get_first_token_id(name) for name in option_names]
+                cand_logits = torch.tensor([last_token_logits[cid].item() for cid in cand_ids])
+
+                # Softmax over only the candidate options
+                probs = torch.softmax(cand_logits, dim=-1).tolist()
+                prob_dict = {name: round(p, 4) for name, p in zip(option_names, probs)}
                 best_choice = max(prob_dict, key=prob_dict.get)
                 confidence = calculate_choice_confidence(prob_dict)
+
                 answers[q_id] = ChoiceAnswer(
                     choice=best_choice,
                     probabilities=prob_dict,
                     confidence=round(confidence, 4)
                 )
+
             elif isinstance(question, ScoreQuestion):
-                q_content = f"Evaluate score: {question.instructions}"
+                level_names = list(question.levels.keys())
+                levels_str = "\n".join([f"- Level {k}: {v}" for k, v in question.levels.items()])
+                q_content = f"Evaluation: {question.instructions}\nRubric:\n{levels_str}\nScore Level:"
                 q_text = self._format_chat(role="user", content=q_content, add_generation_prompt=True)
                 q_inputs = self.tokenizer(q_text, return_tensors="pt").to(self.device)
-                q_out = self.backbone(**q_inputs, past_key_values=state_kv_cache)
-                query_hidden = q_out.last_hidden_state[:, -1, :].squeeze(0)
-                level_names = list(question.levels.keys())
-                level_texts = [f"Level {k}: {v}" for k, v in question.levels.items()]
-                level_hiddens = torch.stack([self._get_embedding(t) for t in level_texts])
 
-                level_probs = self.choice_head(query_hidden, level_hiddens).tolist()
-                prob_dict = {name: round(p, 4) for name, p in zip(level_names, level_probs)}
+                # Single forward pass!
+                q_out = self.backbone(**q_inputs, past_key_values=state_kv_cache)
+                last_token_logits = q_out.logits[0, -1, :]
+
+                # Read logits for each level (e.g. "1", "2", "3")
+                level_ids = [self._get_first_token_id(name) for name in level_names]
+                level_logits = torch.tensor([last_token_logits[lid].item() for lid in level_ids])
+
+                probs = torch.softmax(level_logits, dim=-1).tolist()
+                prob_dict = {name: round(p, 4) for name, p in zip(level_names, probs)}
                 confidence = calculate_score_confidence(prob_dict)
 
-                # Compute expected score dynamically from level probabilities
-                raw_score = self.score_head(prob_dict)
+                # Calculate expected value score
+                try:
+                    expected_score = sum(float(k) * p for k, p in prob_dict.items())
+                except ValueError:
+                    expected_score = 1.0
 
                 answers[q_id] = ScoreAnswer(
-                    score=raw_score,
+                    score=round(expected_score, 2),
                     probabilities=prob_dict,
                     confidence=round(confidence, 4)
                 )
-        return SystemOneResponse(model=self.model_version, answers=answers)   
+
+        return SystemOneResponse(model=self.model_version, answers=answers)
