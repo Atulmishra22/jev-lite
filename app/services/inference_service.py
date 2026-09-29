@@ -26,7 +26,7 @@ class InferenceService:
         # offload the heavy pytroch execution to a worker theread so the async event loop never bloacks
         response = await asyncio.to_thread(self.engine.evaluate, request)
 
-        logger.inof("sucessfully evaluated questions")
+        logger.info("sucessfully evaluated questions")
 
         return response
 
