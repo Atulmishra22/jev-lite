@@ -119,8 +119,9 @@ class SystemOneEngine(nn.Module):
                 q_out = self.backbone(**q_inputs, past_key_values=state_kv_cache)
                 last_token_logits = q_out.logits[0, -1, :]
 
-                # Read logits for each level (e.g. "1", "2", "3")
-                level_ids = [self._get_first_token_id(name) for name in level_names]
+                # Get the descriptive word for each level (e.g. "Low", "Medium", "High")
+                level_words = [question.levels[k].split()[0] for k in level_names]
+                level_ids = [self._get_first_token_id(w) for w in level_words]
                 level_logits = torch.tensor([last_token_logits[lid].item() for lid in level_ids])
 
                 probs = torch.softmax(level_logits, dim=-1).tolist()
