@@ -1,1 +1,30 @@
-.venv
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build & packaging
+build/
+dist/
+*.egg-info/
+
+# Model checkpoints / HuggingFace cache
+models/
+*.pt
+*.bin
+*.safetensors
+.cache/
+
+# Environment variables & secrets
+.env
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
