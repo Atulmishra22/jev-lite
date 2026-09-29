@@ -43,7 +43,7 @@ class ChoiceHead(nn.Module):
         super().__init__()
         self.project = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, query_hidden: torch.Tensor, option_hiddens: torch.Tensor, temperatue: float = 1.0) -> torch.Tensor:
+    def forward(self, query_hidden: torch.Tensor, option_hiddens: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
         """
         query_hidden : [hidden_size] (represtation of state + question)
         option_hiddens : [num_options, hidden_size] (representation of the critearia options)
@@ -56,5 +56,5 @@ class ChoiceHead(nn.Module):
         logits = torch.matmul( option_hiddens, projected_query) / (query_hidden.shape[-1] ** 0.5)
 
         # apply softmax with temperature
-        probs = torch.softmax(logits / temperatue, dim=-1)  # shape : [num_options]
+        probs = torch.softmax(logits / temperature, dim=-1)  # shape : [num_options]
         return probs
