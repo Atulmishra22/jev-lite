@@ -29,9 +29,10 @@ class SystemOneEngine(nn.Module):
         hidden_size = self.backbone.config.hidden_size
 
         # 2. Attach our system one  decision heads
-        self.noul_head = NoulHead(hidden_size).to(self.device)
-        self.score_head = ScoreHead(hidden_size).to(self.device)
-        self.choice_head = ChoiceHead(hidden_size).to(self.device)
+        dtype = self.backbone.dtype
+        self.noul_head = NoulHead(hidden_size).to(self.device, dtype=dtype)
+        self.score_head = ScoreHead(hidden_size).to(self.device, dtype=dtype)
+        self.choice_head = ChoiceHead(hidden_size).to(self.device, dtype=dtype)
 
     def _format_state(self, state: Union[str, dict[str,Any], list[Any]]) -> str:
         if isinstance(state, str):
