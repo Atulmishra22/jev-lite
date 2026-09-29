@@ -25,7 +25,7 @@ class ChoiceHead(nn.Module):
 
 class NoulHead(nn.Module):
     """
-    Evaluates True/False by comparing alignment against affirmation vs negation.
+    Evaluates Yes/No by comparing alignment against affirmation vs negation.
     """
     def __init__(self, hidden_size: int = None):
         super().__init__()
@@ -38,9 +38,9 @@ class NoulHead(nn.Module):
         sim_true = torch.dot(query_norm.squeeze(0), true_norm.squeeze(0))
         sim_false = torch.dot(query_norm.squeeze(0), false_norm.squeeze(0))
 
-        # Softmax over True vs False (scaled by 0.1)
+        # Softmax over Yes vs No (scaled by 0.1)
         probs = torch.softmax(torch.stack([sim_false, sim_true]) / 0.1, dim=-1)
-        return probs[1].item()  # Probability of True
+        return probs[1].item()  # Probability of Yes
 
 
 class ScoreHead(nn.Module):
