@@ -63,7 +63,7 @@ class SystemOneEngine(nn.Module):
         for q_id, question in request.questions.items():
             if isinstance(question, NoulQuestion):
                 # Format truth verification prompt
-                q_content = f"Statement: {question.statement}\nIs this statement true? (Answer True or False):"
+                q_content = f"Statement: {question.statement}\nIs this statement true? (Answer Yes or No):"
                 q_text = self._format_chat(role="user", content=q_content, add_generation_prompt=True)
                 q_inputs = self.tokenizer(q_text, return_tensors="pt").to(self.device)
 
@@ -71,11 +71,11 @@ class SystemOneEngine(nn.Module):
                 q_out = self.backbone(**q_inputs, past_key_values=state_kv_cache)
                 last_token_logits = q_out.logits[0, -1, :]
 
-                # Read logits for candidate words "True" vs "False"
-                true_id = self._get_first_token_id("True")
-                false_id = self._get_first_token_id("False")
+                # Read logits for candidate words "Yes" vs "No"
+                yes_id = self._get_first_token_id("Yes")
+                no_id = self._get_first_token_id("No")
                 
-                tf_logits = torch.tensor([last_token_logits[false_id].item(), last_token_logits[true_id].item()])
+                tf_logits = torch.tensor([last_token_logits[no_id].item(), last_token_logits[yes_id].item()])
                 tf_probs = torch.softmax(tf_logits, dim=-1)
                 true_prob = tf_probs[1].item()
 
@@ -110,8 +110,8 @@ class SystemOneEngine(nn.Module):
 
             elif isinstance(question, ScoreQuestion):
                 level_names = list(question.levels.keys())
-                levels_str = "\n".join([f"- Level {k}: {v}" for k, v in question.levels.items()])
-                q_content = f"Evaluation: {question.instructions}\nRubric:\n{levels_str}\nScore Level:"
+                levels_str = "\n".join([f"- {k}: {v}" for k, v in question.levels.items()])
+                q_content = f"Evaluation: {question.instructions}\nRubric:\n{levels_str}\nAnswer with the score number:"
                 q_text = self._format_chat(role="user", content=q_content, add_generation_prompt=True)
                 q_inputs = self.tokenizer(q_text, return_tensors="pt").to(self.device)
 
