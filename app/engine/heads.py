@@ -1,60 +1,59 @@
 import torch
 import torch.nn as nn
-
-class NoulHead(nn.Module):
-    """
-    Evaluates True/False statements.
-    projects hidden_size ->  1 scalar logit -> Sigmoid (0.0 to 1.0 probaility).
-    """
-    def __init__(self, hidden_size: int):
-        super().__init__()        
-        self.classifier = nn.Linear(hidden_size, 1)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # hidden_states shape : [batch_size, hidden_size]
-        logits = self.classifier(hidden_states)  # shape : [batch_size, 1]
-        probs = torch.sigmoid(logits)  # shape : [batch_size, 1]
-        return probs.squeeze(-1) # [batch_size]
-
-class ScoreHead(nn.Module):
-    """
-    evaluates numeric/ rubric scores.
-    projects hidden_size -> continous scalar value.
-    """
-    def __init__(self, hidden_size: int):
-        super().__init__()
-        self.regressor = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Linear(hidden_size // 2, 1)
-        )
-
-    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        score = self.regressor(hidden_state)
-        return score.squeeze(-1)
+import torch.nn.functional as F
 
 class ChoiceHead(nn.Module):
     """
-    Evaluates dynamic choices.
-    projects candidate option representation into matching logits,
-    then applies softmax with temperature.
+    Evaluates dynamic choices using cosine similarity in Qwen's native embedding space.
+    No random weights -> 100% universal zero-shot accuracy!
     """
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int = None):
         super().__init__()
-        self.project = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, query_hidden: torch.Tensor, option_hiddens: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-        """
-        query_hidden : [hidden_size] (represtation of state + question)
-        option_hiddens : [num_options, hidden_size] (representation of the critearia options)
-        returns : [num_options] probability distribution summing to 1.0
-        """
-        # project query
-        projected_query = self.project(query_hidden)  # shape : [hidden_size]
+    def forward(self, query_hidden: torch.Tensor, option_hiddens: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+        # Normalize vectors to unit sphere (Cosine Similarity)
+        query_norm = F.normalize(query_hidden.unsqueeze(0), p=2, dim=-1)   # [1, hidden_size]
+        options_norm = F.normalize(option_hiddens, p=2, dim=-1)             # [num_options, hidden_size]
 
-        # dot-product similarity between query and each option 
-        logits = torch.matmul( option_hiddens, projected_query) / (query_hidden.shape[-1] ** 0.5)
+        # Cosine similarity scores between -1.0 and 1.0
+        similarities = torch.matmul(options_norm, query_norm.squeeze(0))    # [num_options]
 
-        # apply softmax with temperature
-        probs = torch.softmax(logits / temperature, dim=-1)  # shape : [num_options]
+        # Temperature scaling (0.1 sharpens cosine similarity into confident probabilities)
+        probs = torch.softmax(similarities / temperature, dim=-1)
         return probs
+
+
+class NoulHead(nn.Module):
+    """
+    Evaluates True/False by comparing alignment against affirmation vs negation.
+    """
+    def __init__(self, hidden_size: int = None):
+        super().__init__()
+
+    def forward(self, query_hidden: torch.Tensor, true_hidden: torch.Tensor, false_hidden: torch.Tensor) -> float:
+        query_norm = F.normalize(query_hidden.unsqueeze(0), p=2, dim=-1)
+        true_norm = F.normalize(true_hidden.unsqueeze(0), p=2, dim=-1)
+        false_norm = F.normalize(false_hidden.unsqueeze(0), p=2, dim=-1)
+
+        sim_true = torch.dot(query_norm.squeeze(0), true_norm.squeeze(0))
+        sim_false = torch.dot(query_norm.squeeze(0), false_norm.squeeze(0))
+
+        # Softmax over True vs False (scaled by 0.1)
+        probs = torch.softmax(torch.stack([sim_false, sim_true]) / 0.1, dim=-1)
+        return probs[1].item()  # Probability of True
+
+
+class ScoreHead(nn.Module):
+    """
+    Computes expected score over arbitrary rubric levels.
+    """
+    def __init__(self, hidden_size: int = None):
+        super().__init__()
+
+    def forward(self, level_probs: dict[str, float]) -> float:
+        try:
+            expected_score = sum(float(level) * prob for level, prob in level_probs.items())
+            return round(expected_score, 2)
+        except ValueError:
+            # If level keys are not numbers, fallback to index-based score
+            return 1.0

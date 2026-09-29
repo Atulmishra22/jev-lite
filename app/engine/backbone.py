@@ -71,11 +71,12 @@ class SystemOneEngine(nn.Module):
                 q_inputs = self.tokenizer(q_text, return_tensors="pt").to(self.device)
 
                 q_out = self.backbone(**q_inputs, past_key_values= state_kv_cache)
-                hidden = q_out.last_hidden_state[:, -1, :]
-                prob = self.noul_head(hidden).item()
+                query_hidden = q_out.last_hidden_state[:, -1, :].squeeze(0)
+                true_emb = self._get_embedding("Yes, this statement is true.")
+                false_emb = self._get_embedding("No, this statement is false.")
+                prob = self.noul_head(query_hidden, true_emb, false_emb)
 
                 answers[q_id] = NoulAnswer(noul=round(prob, 4))
-
             elif isinstance(question, ChoiceQuestion):
                 q_content = f"Question: {question.instructions}\nSelect the best option from the criteria."
                 q_text = self._format_chat(role="user", content=q_content, add_generation_prompt=True)
@@ -100,16 +101,20 @@ class SystemOneEngine(nn.Module):
                 q_text = self._format_chat(role="user", content=q_content, add_generation_prompt=True)
                 q_inputs = self.tokenizer(q_text, return_tensors="pt").to(self.device)
                 q_out = self.backbone(**q_inputs, past_key_values=state_kv_cache)
-                query_hidden = q_out.last_hidden_state[:, -1, :]
-                raw_score = self.score_head(query_hidden).item()
+                query_hidden = q_out.last_hidden_state[:, -1, :].squeeze(0)
                 level_names = list(question.levels.keys())
                 level_texts = [f"Level {k}: {v}" for k, v in question.levels.items()]
                 level_hiddens = torch.stack([self._get_embedding(t) for t in level_texts])
-                level_probs = self.choice_head(query_hidden.squeeze(0), level_hiddens).tolist()
+
+                level_probs = self.choice_head(query_hidden, level_hiddens).tolist()
                 prob_dict = {name: round(p, 4) for name, p in zip(level_names, level_probs)}
                 confidence = calculate_score_confidence(prob_dict)
+
+                # Compute expected score dynamically from level probabilities
+                raw_score = self.score_head(prob_dict)
+
                 answers[q_id] = ScoreAnswer(
-                    score=round(raw_score, 2),
+                    score=raw_score,
                     probabilities=prob_dict,
                     confidence=round(confidence, 4)
                 )
