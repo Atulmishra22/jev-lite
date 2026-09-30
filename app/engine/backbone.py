@@ -52,19 +52,22 @@ class SystemOneEngine(nn.Module):
         return token_ids[0] if token_ids else self.tokenizer.encode(word.strip(), add_special_tokens=False)[0]
 
     def _expand_kv_cache(self, kv_cache, batch_size: int):
-        """ expand the state KV-cache to match the batch size of the question chunk."""
-        if isinstance(kv_cache, DynamicCache):
-            new_cache = DynamicCache()
-            for k, v in zip(kv_cache.key_cache, kv_cache.value_cache):
-                new_cache.key_cache.append(k.repeat( batch_size, 1, 1, 1))
-                new_cache.value_cache.append(v.repeat( batch_size, 1, 1, 1))
-            return new_cache
+        """Expands the state KV-cache to match the question batch size."""
+        if batch_size == 1:
+            return kv_cache
 
-        else:
-            return tuple(
-                (k.repeat(batch_size,1,1,1), v.repeat(batch_size,1,1,1))
-                for k, v in kv_cache
-            )
+        import copy
+
+        # Use native DynamicCache method designed specifically for prompt/state caching
+        if hasattr(kv_cache, "batch_repeat_interleave"):
+            expanded = copy.deepcopy(kv_cache)
+            expanded.batch_repeat_interleave(batch_size)
+            return expanded
+
+        return tuple(
+            (k.repeat(batch_size, 1, 1, 1), v.repeat(batch_size, 1, 1, 1))
+            for k, v in kv_cache
+        )
 
     @torch.no_grad()
     def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
