@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     # calibration parameters
     default_temperature: float = 1.0
 
+    # parallel batch chunk size for GPU VRAM safety
+    batch_chunk_size: int = 32
+
     # API coonfiguration
     api_title: str = "jev-Lite System one Engine"
     api_version: str = "v1"
