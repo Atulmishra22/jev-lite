@@ -2,7 +2,9 @@ from fastapi import APIRouter, HTTPException, status
 from app.schemas.request import SystemOneRequest
 from app.schemas.response import SystemOneResponse
 from app.services.inference_service import inference_service
+from app.services.scheduler import scheduler
 from app.core.config import settings
+
 
 router = APIRouter()
 
@@ -22,7 +24,7 @@ async def evaluate_system_one(request: SystemOneRequest) -> SystemOneResponse:
         HTTPException: If the model engine is not initialized or if there is an error during evaluation.
     """
     try:
-        response = await inference_service.predict(request)
+        response = await scheduler.submit(request)
         return response
     except RuntimeError as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))

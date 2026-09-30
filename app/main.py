@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.engine.backbone import SystemOneEngine
 from app.services.inference_service import inference_service
 from app.api.v1.router import api_router
+from app.services.scheduler import scheduler
 
 # configure structured logging
 
@@ -30,12 +31,16 @@ async def lifespan(app: FastAPI):
 
     # 2. inject into the inference service
     inference_service.set_engine(engine)
-    logger.info("system one engine loaded successfully and ready for traffic!")
+
+    # 3. start the dynamic batch scheduler
+    await scheduler.start()
+    logger.info("system one engine loaded successfully and Dynamic Scheduler ready for traffic!")
 
     yield  # app is live and serving requests here
 
     # --- SHUTDOWN PHASE ---
     logger.info("shutting down jev-lite service...")
+    await scheduler.stop()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logger.info("cleanup complete. Goodbye!")

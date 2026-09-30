@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     # parallel batch chunk size for GPU VRAM safety
     batch_chunk_size: int = 32
 
+    # scheduler settings
+    scheduler_max_batch_size : int = 16  #maximum request to bundle per batch
+    scheduler_max_delay_ms : float = 10.0 # maximum collection window (10ms)
+    scheduler_max_queue_size: int = 1024  # backpressure limit ( rejects 429 if full)
+
     # API coonfiguration
     api_title: str = "jev-Lite System one Engine"
     api_version: str = "v1"
