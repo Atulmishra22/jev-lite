@@ -3,8 +3,8 @@ import torch
 
 class Settings(BaseSettings):
     # Model configuration
-    model_name: str = "Qwen/Qwen2.5-0.5B"
-    model_version: str = "jev-lite-0.1"
+    model_name: str = "Qwen/Qwen2.5-3B"
+    model_version: str = "jev-lite-3b"
 
     # Device management: auto-detect cCUDA, fallback to CPU
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
