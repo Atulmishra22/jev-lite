@@ -69,6 +69,67 @@ class SystemOneEngine(nn.Module):
             for k, v in kv_cache
         )
 
+    def _score_candidates(
+        self,
+        prefix_prompt: str,
+        candidates: dict[str, str],
+        state_kv_cache,
+        state_seq_len: int,
+        temperature: float = 0.2,
+        length_penalty: float = 0.7,
+    ) -> dict[str, float]:
+        """
+        Evaluates candidate full option sequences in ONE parallel forward pass
+        using the state's cached KV states.
+        """
+        cand_keys = list(candidates.keys())
+        prefix_text = self._format_chat(role="user", content=prefix_prompt, add_generation_prompt=True)
+        prefix_ids = self.tokenizer.encode(prefix_text, add_special_tokens=False)
+        prefix_len = len(prefix_ids)
+
+        full_sequences = []
+        target_spans = []
+        for k in cand_keys:
+            cand_text = f" {candidates[k].strip()}"
+            cand_ids = self.tokenizer.encode(cand_text, add_special_tokens=False)
+            seq = prefix_ids + cand_ids
+            full_sequences.append(torch.tensor(seq, dtype=torch.long))
+            target_spans.append((prefix_len, len(seq)))
+
+        num_cands = len(cand_keys)
+        from torch.nn.utils.rnn import pad_sequence
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        padded_inputs = pad_sequence(full_sequences, batch_first=True, padding_value=pad_id).to(self.device)
+
+        inputs_mask = (padded_inputs != pad_id).long()
+        state_mask = torch.ones((num_cands, state_seq_len), dtype=torch.long, device=self.device)
+        full_mask = torch.cat([state_mask, inputs_mask], dim=1)
+
+        batched_kv = self._expand_kv_cache(state_kv_cache, num_cands)
+
+        outputs = self.backbone(
+            input_ids=padded_inputs,
+            attention_mask=full_mask,
+            past_key_values=batched_kv,
+            use_cache=False
+        )
+
+        log_probs = torch.log_softmax(outputs.logits, dim=-1)
+
+        scores = []
+        for i, (start_idx, end_idx) in enumerate(target_spans):
+            # In causal LM, token at position pos is predicted by logits at pos - 1
+            pred_logits = log_probs[i, start_idx - 1 : end_idx - 1, :]
+            target_tokens = padded_inputs[i, start_idx : end_idx]
+            cand_token_log_probs = pred_logits.gather(dim=-1, index=target_tokens.unsqueeze(-1)).squeeze(-1)
+            token_count = float(end_idx - start_idx)
+            cand_score = cand_token_log_probs.sum() / (token_count ** length_penalty)
+            scores.append(cand_score)
+
+        score_tensor = torch.stack(scores)
+        calibrated_probs = torch.softmax(score_tensor / temperature, dim=-1).tolist()
+        return {k: round(p, 4) for k, p in zip(cand_keys, calibrated_probs)}
+
     @torch.no_grad()
     def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
         # Step 1: Ingest State ONCE to get KV-cache
@@ -80,90 +141,65 @@ class SystemOneEngine(nn.Module):
         state_outputs = self.backbone(**state_inputs, use_cache=True)
         state_kv_cache = state_outputs.past_key_values
 
-        q_items = list(request.questions.items())
-        prompts = []
-        for qid, q in q_items:
+        answers: dict[str, Answer] = {}
+
+        for qid, q in request.questions.items():
             if isinstance(q, NoulQuestion):
-                q_content = f"Statement: {q.statement}\nIs this statement true? (Answer Yes or No):"
+                prefix = f"Statement: {q.statement}\nIs this statement true or false?"
+                candidates = {
+                    "true": "Yes, this statement is accurate and true.",
+                    "false": "No, this statement is incorrect and false."
+                }
+                prob_dict = self._score_candidates(
+                    prefix_prompt=prefix,
+                    candidates=candidates,
+                    state_kv_cache=state_kv_cache,
+                    state_seq_len=state_seq_len,
+                    temperature=settings.default_temperature
+                )
+                answers[qid] = NoulAnswer(noul=round(prob_dict["true"], 4))
+
             elif isinstance(q, ChoiceQuestion):
-                options_str = "\n".join([f"- {k}: {v}" for k, v in q.criteria.items()])
-                q_content = f"Question: {q.instructions}\nOptions:\n{options_str}\nSelected Option:"
+                prefix = f"Question: {q.instructions}\nSelected Option:"
+                candidates = {k: f"{k}: {v}" for k, v in q.criteria.items()}
+                prob_dict = self._score_candidates(
+                    prefix_prompt=prefix,
+                    candidates=candidates,
+                    state_kv_cache=state_kv_cache,
+                    state_seq_len=state_seq_len,
+                    temperature=settings.default_temperature
+                )
+                best_choice = max(prob_dict, key=prob_dict.get)
+                confidence = calculate_choice_confidence(prob_dict)
+                answers[qid] = ChoiceAnswer(
+                    choice=best_choice,
+                    probabilities=prob_dict,
+                    confidence=round(confidence, 4)
+                )
+
             elif isinstance(q, ScoreQuestion):
-                levels_str = "\n".join([f"- {k}: {v}" for k, v in q.levels.items()])
-                q_content = f"Evaluation: {q.instructions}\nRubric:\n{levels_str}\nAnswer with the score number:"
+                prefix = f"Evaluation: {q.instructions}\nRubric Evaluation:"
+                candidates = {k: f"Score {k} - {v}" for k, v in q.levels.items()}
+                prob_dict = self._score_candidates(
+                    prefix_prompt=prefix,
+                    candidates=candidates,
+                    state_kv_cache=state_kv_cache,
+                    state_seq_len=state_seq_len,
+                    temperature=settings.default_temperature
+                )
+                confidence = calculate_score_confidence(prob_dict)
+                try:
+                    expected_score = sum(float(k) * p for k, p in prob_dict.items())
+                except ValueError:
+                    expected_score = 1.0
+
+                answers[qid] = ScoreAnswer(
+                    score=round(expected_score, 2),
+                    probabilities=prob_dict,
+                    confidence=round(confidence, 4)
+                )
             else:
                 raise ValueError(f"Unsupported question type: {type(q)}")
-
-            prompts.append(self._format_chat(role="user", content=q_content, add_generation_prompt=True))
-
-        answers: dict[str, Answer] = {}
-        chunk_size = settings.batch_chunk_size
-
-        # stream in parallel chunks to avoid GPU VRAM OOM
-        for i in range(0, len(q_items), chunk_size):
-            chunk_q_items = q_items[i:i + chunk_size]
-            chunk_prompts = prompts[i:i + chunk_size]
-            current_batch_size = len(chunk_q_items)
-
-            # Process this chunk in parallel
-            q_inputs = self.tokenizer(chunk_prompts, padding=True, return_tensors="pt").to(self.device)
-
-            # build full attention mask covering state + questions
-            state_mask = torch.ones((current_batch_size, state_seq_len), dtype=torch.long, device=self.device)
-            full_mask = torch.cat([state_mask, q_inputs.attention_mask], dim=1)
-
-            # expand state KV cache to current batch size
-            batched_kv = self._expand_kv_cache(state_kv_cache, current_batch_size)
-
-            '''
-            parallel foward pass for entir chunk
-            '''
-            q_out = self.backbone(input_ids=q_inputs.input_ids, attention_mask=full_mask, past_key_values=batched_kv)
-
-            # extract answers for all questions in this chunk
-            for idx, (qid, q) in enumerate(chunk_q_items):
-                last_token_logits = q_out.logits[idx, -1, :]
-
-                if isinstance(q, NoulQuestion):
-                    yes_id = self._get_first_token_id("Yes")
-                    no_id = self._get_first_token_id("No")
-                    tf_logits = torch.tensor([last_token_logits[no_id].item(), last_token_logits[yes_id].item()])
-                    prob = torch.softmax(tf_logits, dim=-1)[1].item()
-                    answers[qid] = NoulAnswer(noul=round(prob, 4))
-
-                elif isinstance(q, ChoiceQuestion):
-                    option_names = list(q.criteria.keys())
-                    cand_ids = [self._get_first_token_id(name) for name in option_names]
-                    cand_logits = torch.tensor([last_token_logits[cid].item() for cid in cand_ids])
-                    probs = torch.softmax(cand_logits, dim=-1).tolist()
-                    prob_dict = {name: round(p, 4) for name, p in zip(option_names, probs)}
-                    best_choice = max(prob_dict, key=prob_dict.get)
-                    confidence = calculate_choice_confidence(prob_dict)
-                    answers[qid] = ChoiceAnswer(
-                        choice=best_choice,
-                        probabilities=prob_dict,
-                        confidence=round(confidence, 4)
-                    )
-
-                elif isinstance(q, ScoreQuestion):
-                    level_names = list(q.levels.keys())
-                    level_words = [q.levels[k].split()[0] for k in level_names]
-                    level_ids = [self._get_first_token_id(w) for w in level_words]
-                    level_logits = torch.tensor([last_token_logits[lid].item() for lid in level_ids])
-                    probs = torch.softmax(level_logits, dim=-1).tolist()
-                    prob_dict = {name: round(p, 4) for name, p in zip(level_names, probs)}
-                    confidence = calculate_score_confidence(prob_dict)
-
-                    try:
-                        expected_score = sum(float(k) * p for k, p in prob_dict.items())
-                    except ValueError:
-                        expected_score = 1.0
-
-                    answers[qid] = ScoreAnswer(
-                        score=round(expected_score, 2),
-                        probabilities=prob_dict,
-                        confidence=round(confidence, 4)
-                    )
 
         return SystemOneResponse(model=self.model_version, answers=answers)
     
