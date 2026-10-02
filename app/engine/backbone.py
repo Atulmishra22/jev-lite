@@ -145,10 +145,10 @@ class SystemOneEngine(nn.Module):
 
         for qid, q in request.questions.items():
             if isinstance(q, NoulQuestion):
-                prefix = f"Statement: {q.statement}\nIs this statement true or false?"
+                prefix = f"Statement: {q.statement}\nIs this statement true or false? Answer with True or False:"
                 candidates = {
-                    "true": "Yes, this statement is accurate and true.",
-                    "false": "No, this statement is incorrect and false."
+                    "true": "True",
+                    "false": "False"
                 }
                 prob_dict = self._score_candidates(
                     prefix_prompt=prefix,
@@ -160,8 +160,14 @@ class SystemOneEngine(nn.Module):
                 answers[qid] = NoulAnswer(noul=round(prob_dict["true"], 4))
 
             elif isinstance(q, ChoiceQuestion):
-                prefix = f"Question: {q.instructions}\nSelected Option:"
-                candidates = {k: f"{k}: {v}" for k, v in q.criteria.items()}
+                options_str = "\n".join([f"- {k}: {v}" for k, v in q.criteria.items()])
+                keys_list = ", ".join(list(q.criteria.keys()))
+                prefix = (
+                    f"Question: {q.instructions}\n"
+                    f"Options:\n{options_str}\n"
+                    f"Answer with the choice key directly ({keys_list}):"
+                )
+                candidates = {k: k for k in q.criteria.keys()}
                 prob_dict = self._score_candidates(
                     prefix_prompt=prefix,
                     candidates=candidates,
@@ -178,8 +184,14 @@ class SystemOneEngine(nn.Module):
                 )
 
             elif isinstance(q, ScoreQuestion):
-                prefix = f"Evaluation: {q.instructions}\nRubric Evaluation:"
-                candidates = {k: f"Score {k} - {v}" for k, v in q.levels.items()}
+                levels_str = "\n".join([f"- {k}: {v}" for k, v in q.levels.items()])
+                levels_list = ", ".join(list(q.levels.keys()))
+                prefix = (
+                    f"Evaluation: {q.instructions}\n"
+                    f"Rubric Levels:\n{levels_str}\n"
+                    f"Answer with the score level directly ({levels_list}):"
+                )
+                candidates = {k: k for k in q.levels.keys()}
                 prob_dict = self._score_candidates(
                     prefix_prompt=prefix,
                     candidates=candidates,
